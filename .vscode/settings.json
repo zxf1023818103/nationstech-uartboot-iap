@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "termios.h": "c",
+        "getopt.h": "c",
+        "termios-baud.h": "c"
+    }
+}

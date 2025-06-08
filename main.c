@@ -1,0 +1,555 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <unistd.h>
+#include <termios.h>
+#include <getopt.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#define CMD_GET_INF 0x10
+#define CMD_GET_RNG 0x20
+#define CMD_KEY_UPDATE 0x21
+#define CMD_FLASH_ERASE 0x30
+#define CMD_FLASH_DWNLD 0x31
+#define CMD_DATA_CRC_CHECK 0x32
+#define CMD_OPT_RW 0x40
+#define CMD_USERX_OP 0x41
+#define CMD_SYS_RESET 0x50
+
+#pragma pack(1)
+
+struct resp_get_inf {
+    uint8_t model_id;
+    uint8_t bootcmd_version_major : 4;
+    uint8_t bootcmd_version_minor : 4;
+    uint8_t boot_version_minor : 4;
+    uint8_t boot_version_major : 4;
+    uint8_t ucid[16];
+    uint8_t chip_id[12];
+    uint8_t dbgmcu_idcode[4];
+    uint8_t reserved[16];
+};
+
+struct resp_key_rng {
+    uint8_t rng[16];
+};
+
+struct resp_opt_rw {
+    uint8_t RDP, nRDP, USER, nUSER, Data0, nData0, Data1, nData1, WRP0, nWRP0, WRP1, nWRP1, WRP2, nWRP2, WRP3, nWRP3, RDP2, nRDP2, Reserved, nReserved;
+};
+
+struct resp_userx_op {
+    uint8_t partition_id;
+    uint8_t partition_16k_bytes;
+    uint8_t id_configured;
+    uint8_t authentication_required : 4;
+    uint8_t encrypted : 4;
+};
+
+#pragma pack()
+
+enum parser_state {
+    STATE_HEADER1 = 0,
+    STATE_HEADER2,
+    STATE_CMD_H,
+    STATE_CMD_L,
+    STATE_DATA_LEN_L,
+    STATE_DATA_LEN_H,
+    STATE_DATA,
+    STATE_CR1,
+    STATE_CR2,
+    STATE_CHECKSUM,
+};
+
+enum parser_ret {
+    PARSER_OK = 0,
+    PARSER_MORE_DATA_REQUIRED = 1,
+    PARSER_CHECKSUM_ERROR = -1,
+    PARSER_UNEXPECTED_STATE = -2,
+    PARSER_UART_ERROR = -3,
+};
+
+typedef int (*uart_send_func_t)(void *args, const uint8_t *data, int len);
+typedef int (*uart_recv_func_t)(void *args, uint8_t *data, int len);
+typedef int (*firmeware_recv_func_t)(void *args, uint8_t *data, int len);
+
+static const char *parser_state_to_string(enum parser_state state)
+{
+    switch (state) {
+        case STATE_HEADER1: return "STATE_HEADER1";
+        case STATE_HEADER2: return "STATE_HEADER2";
+        case STATE_CMD_H: return "STATE_CMD_H";
+        case STATE_CMD_L: return "STATE_CMD_L";
+        case STATE_DATA_LEN_L: return "STATE_DATA_LEN_L";
+        case STATE_DATA_LEN_H: return "STATE_DATA_LEN_H";
+        case STATE_DATA: return "STATE_DATA";
+        case STATE_CR1: return "STATE_CR1";
+        case STATE_CR2: return "STATE_CR2";
+        case STATE_CHECKSUM: return "STATE_CHECKSUM";
+        default: return "UNKNOWN_STATE";
+    }
+}
+
+static const char *parser_ret_to_string(int ret)
+{
+    switch (ret) {
+        case PARSER_OK: return "PARSER_OK";
+        case PARSER_MORE_DATA_REQUIRED: return "PARSER_MORE_DATA_REQUIRED";
+        case PARSER_CHECKSUM_ERROR: return "PARSER_CHECKSUM_ERROR";
+        case PARSER_UNEXPECTED_STATE: return "PARSER_UNEXPECTED_STATE";
+        case PARSER_UART_ERROR: return "PARSER_UART_ERROR";
+        default: return "UNKNOWN_RET";
+    }
+}
+
+static enum parser_ret parse_one_byte(uart_recv_func_t uart_recv, void *args, uint8_t *cmd_h, uint8_t *cmd_l, uint8_t *data, uint16_t *data_len, uint8_t *cr1, uint8_t *cr2,
+                        enum parser_state *state, uint16_t *current_data_len, uint8_t *current_checksum, uint8_t *checksum)
+{
+    uint8_t input;
+    if (uart_recv(args, &input, 1) < 0) {
+        return PARSER_UART_ERROR; // Error or no data received
+    }
+
+    enum parser_ret ret = PARSER_MORE_DATA_REQUIRED;
+    enum parser_state prev_state = *state;
+    switch (prev_state) {
+        case STATE_HEADER1: {
+            *current_checksum = *checksum = 0;
+            *current_data_len = *data_len = 0;
+            *cmd_h = *cmd_l = 0;
+            *cr1 = *cr2 = 0;
+            if (input == 0xAA) {
+                *state = STATE_HEADER2;
+                *current_checksum ^= input;
+            }
+            break;
+        }
+        case STATE_HEADER2: {
+            if (input == 0x55) {
+                *state = STATE_CMD_H;
+                *current_checksum ^= input;
+            } else {
+                *state = STATE_HEADER1;
+            }
+            break;
+        }
+        case STATE_CMD_H: {
+            *cmd_h = input;
+            *current_checksum ^= input;
+            *state = STATE_CMD_L;
+            break;
+        }
+        case STATE_CMD_L: {
+            *cmd_l = input;
+            *current_checksum ^= input;
+            *state = STATE_DATA_LEN_L;
+            break;
+        }
+        case STATE_DATA_LEN_L: {
+            *data_len = input;
+            *current_checksum ^= input;
+            *state = STATE_DATA_LEN_H;
+            break;
+        }
+        case STATE_DATA_LEN_H: {
+            uint16_t data_len_h = input;
+            data_len_h <<= 8;
+            *data_len |= data_len_h;
+            *current_checksum ^= input;
+            if (*data_len > 0) {
+                *state = STATE_DATA;
+            } else {
+                *state = STATE_CR1;
+            }
+            break;
+        }
+        case STATE_DATA: {
+            *current_checksum ^= input;
+            data[(*current_data_len)++] = input;
+            if (*current_data_len == *data_len) {
+                *state = STATE_CR1;
+            }
+            break;
+        }
+        case STATE_CR1: {
+            *current_checksum ^= input;
+            *state = STATE_CR2;
+            *cr1 = input;
+            break;
+        }
+        case STATE_CR2: {
+            *current_checksum ^= input;
+            *state = STATE_CHECKSUM;
+            *cr2 = input;
+            break;
+        }
+        case STATE_CHECKSUM: {
+            *checksum = input;
+            if (*checksum == *current_checksum) {
+                *state = STATE_HEADER1; // Reset state for next command
+                ret = PARSER_OK; // Successfully parsed a complete command
+            } else {
+                *state = STATE_HEADER1; // Reset state on checksum error
+                ret = PARSER_CHECKSUM_ERROR; // Checksum error
+            }
+            break;
+        }
+        default: {
+            *state = STATE_HEADER1; // Reset state on unexpected input
+            ret = PARSER_UNEXPECTED_STATE; // Unexpected state
+            break;
+        }
+    }
+
+    // enum parser_state next_state = *state;
+    // printf("%s() input=0x%02X prev_state=%s next_state=%s cmd_h=0x%02X cmd_l=0x%02X cr1=0x%02X cr2=0x%02X current_data_len=%d data_len=%d current_checksum=0x%02X checksum=0x%02X ret=%s\n",
+    //        __func__, input, parser_state_to_string(prev_state), parser_state_to_string(next_state), *cmd_h, *cmd_l, *cr1, *cr2, *current_data_len, *data_len, *current_checksum, *checksum, parser_ret_to_string(ret));
+
+    return ret;
+}
+
+static enum parser_ret recv_next_packet(uart_recv_func_t uart_recv, void *args, uint8_t *cmd_h, uint8_t *cmd_l, uint8_t **data, uint16_t *data_len, uint8_t *cr1, uint8_t *cr2)
+{
+    enum parser_state state = STATE_HEADER1;
+    uint16_t current_data_len = 0;
+    uint8_t current_checksum = 0;
+    uint8_t checksum = 0;
+
+    while (1) {
+        enum parser_ret parse_ret = parse_one_byte(uart_recv, args, cmd_h, cmd_l, *data, data_len, cr1, cr2, &state, &current_data_len, &current_checksum, &checksum);
+        if (parse_ret != PARSER_MORE_DATA_REQUIRED) {
+            return parse_ret;
+        }
+
+        if (state == STATE_DATA && *data == NULL && *data_len) {
+            *data = malloc(*data_len);
+        }
+    }
+}
+
+static int send_cmd(uart_send_func_t uart_send, void *args, uint8_t cmd_h, uint8_t cmd_l, uint8_t par[4],
+                     const uint8_t *data, uint16_t data_len)
+{
+    uint8_t data_len_l = data_len & 0xFF;
+    uint8_t data_len_h = (data_len >> 8) & 0xFF;
+    uint8_t buf[] = {
+        0xAA, 0x55, cmd_h, cmd_l, data_len_l, data_len_h, par[0], par[1], par[2], par[3],
+    };
+    
+    uint8_t checksum = 0;
+    for (int i = 0; i < sizeof(buf); i++) {
+        checksum ^= buf[i];
+    }
+    for (int i = 0; i < data_len; i++) {
+        checksum ^= data[i];
+    }
+
+    int nbytes = 0;
+    int ret = uart_send(args, buf, sizeof(buf));
+    if (ret == sizeof(buf)) {
+        nbytes += ret;
+        ret = uart_send(args, data, data_len);
+        if (ret == data_len) {
+            nbytes += ret;
+            ret = uart_send(args, &checksum, 1);
+            if (ret == 1) {
+                nbytes += ret;
+                return nbytes;
+            }
+        }
+    }
+
+    return -1;
+}
+
+static int send_cmd_get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, struct resp_get_inf **resp, uint8_t *cr1, uint8_t *cr2)
+{
+    uint8_t cmd_h = 0, cmd_l = 0;
+    uint16_t data_len = 0;
+
+    if (send_cmd(uart_send, args, CMD_GET_INF, 0, (uint8_t[4]){0}, NULL, 0) > 0) {
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        if (ret == PARSER_OK) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args)
+{
+    int ret = 0;
+
+    struct resp_get_inf *resp_inf = NULL;
+    uint8_t cr1 = 0, cr2 = 0;
+    if (send_cmd_get_inf(uart_recv, uart_send, args, &resp_inf, &cr1, &cr2) == 0) {
+        if (cr1 == 0xA0 && cr2 == 0x00) {
+            printf("Device Model ID: %d\n", resp_inf->model_id);
+            printf("Boot Command Version: %d.%d\n", resp_inf->bootcmd_version_major, resp_inf->bootcmd_version_minor);
+            printf("Boot Version: %d.%d\n", resp_inf->boot_version_major, resp_inf->boot_version_minor);
+            printf("UCID: ");
+            for (int i = 0; i < sizeof(resp_inf->ucid); i++) {
+                printf("%02X", resp_inf->ucid[i]);
+            }
+            printf("\n");
+            printf("Chip ID: ");
+            for (int i = 0; i < sizeof(resp_inf->chip_id); i++) {
+                printf("%02X", resp_inf->chip_id[i]);
+            }
+            printf("\n");
+            printf("Debug MCU ID Code: ");
+            for (int i = 0; i < sizeof(resp_inf->dbgmcu_idcode); i++) {
+                printf("%02X", resp_inf->dbgmcu_idcode[i]);
+            }
+            printf("\n");
+        }
+        else {
+            printf("%s: Unexpected response: cr1=0x%02X, cr2=0x%02X\n", __func__, cr1, cr2);
+            ret = -1;
+        }
+    } else {
+        printf("%s: Failed to get chip info.\n", __func__);
+        ret = -1;
+    }
+
+    if (resp_inf) {
+        free(resp_inf);
+    }
+    
+    return ret;
+}
+
+static int send_cmd_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, struct resp_userx_op **resp, uint8_t *cr1, uint8_t *cr2)
+{
+    uint8_t cmd_h = 0, cmd_l = 0;
+    uint16_t data_len = 0;
+
+    if (send_cmd(uart_send, args, CMD_USERX_OP, 0, (uint8_t[4]){partition_id}, NULL, 0) > 0) {
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        if (ret == PARSER_OK) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int get_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id)
+{
+    int ret = 0;
+
+    struct resp_userx_op *resp_userx_op = NULL;
+    uint8_t cr1 = 0, cr2 = 0;
+    if (send_cmd_userx_op(uart_recv, uart_send, args, partition_id, &resp_userx_op, &cr1, &cr2) == 0) {
+        if (cr1 == 0xA0 && cr2 == 0x00) {
+            printf("Partition ID: USER%d\n", resp_userx_op->partition_id + 1);
+            if (resp_userx_op->partition_16k_bytes) {
+                printf("Partition Size: %dk bytes\n", resp_userx_op->partition_16k_bytes * 16);
+            }
+            else {
+                printf("Partition Size: Not configured\n");
+            }
+            printf("ID Configured: %s\n", !resp_userx_op->id_configured ? "Yes" : "No");
+            printf("Authentication Required: %s\n", resp_userx_op->authentication_required ? "Yes" : "No");
+            printf("Encrypted: %s\n", resp_userx_op->encrypted ? "Yes" : "No");
+        }
+        else {
+            printf("%s: Unexpected response: cr1=0x%02X, cr2=0x%02X\n", __func__, cr1, cr2);
+            ret = -1;
+        }
+    } else {
+        printf("%s: Failed to get user partition info.\n", __func__);
+        ret = -1;
+    }
+
+    if (resp_userx_op) {
+        free(resp_userx_op);
+    }
+
+    return ret;
+}
+
+static int send_cmd_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, struct resp_opt_rw **resp, uint8_t *cr1, uint8_t *cr2)
+{
+    uint8_t cmd_h = 0, cmd_l = 0;
+    uint16_t data_len = 0;
+    uint8_t data[20] = {0};
+
+    if (send_cmd(uart_send, args, CMD_OPT_RW, 0, (uint8_t[4]){0}, data, sizeof data) > 0) {
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        if (ret == PARSER_OK) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int get_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args)
+{
+    int ret = 0;
+
+    struct resp_opt_rw *resp_opt_rw = NULL;
+    uint8_t cr1 = 0, cr2 = 0;
+    if (send_cmd_opt_rw(uart_recv, uart_send, args, &resp_opt_rw, &cr1, &cr2) == 0) {
+        if (cr1 == 0xA0 && cr2 == 0x00) {
+            printf("RDP: %d\n", resp_opt_rw->RDP);
+            printf("nRDP: %d\n", resp_opt_rw->nRDP);
+            printf("USER: %d\n", resp_opt_rw->USER);
+            printf("nUSER: %d\n", resp_opt_rw->nUSER);
+            printf("Data0: %d\n", resp_opt_rw->Data0);
+            printf("nData0: %d\n", resp_opt_rw->nData0);
+            printf("Data1: %d\n", resp_opt_rw->Data1);
+            printf("nData1: %d\n", resp_opt_rw->nData1);
+            printf("WRP0: %d\n", resp_opt_rw->WRP0);
+            printf("nWRP0: %d\n", resp_opt_rw->nWRP0);
+            printf("WRP1: %d\n", resp_opt_rw->WRP1);
+            printf("nWRP1: %d\n", resp_opt_rw->nWRP1);
+            printf("WRP2: %d\n", resp_opt_rw->WRP2);
+            printf("nWRP2: %d\n", resp_opt_rw->nWRP2);
+            printf("WRP3: %d\n", resp_opt_rw->WRP3);
+            printf("nWRP3: %d\n", resp_opt_rw->nWRP3);
+            printf("RDP2: %d\n", resp_opt_rw->RDP2);
+            printf("nRDP2: %d\n", resp_opt_rw->nRDP2);
+        }
+        else {
+            printf("%s: Unexpected response: cr1=0x%02X, cr2=0x%02X\n", __func__, cr1, cr2);
+            ret = -1;
+        }
+    }
+}
+
+static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *cr1, uint8_t *cr2)
+{
+    uint8_t cmd_h = 0, cmd_l = 0;
+    uint16_t data_len = 0;
+
+    if (send_cmd(uart_send, args, CMD_FLASH_ERASE, 0, (uint8_t[4]){partition_id}, NULL, 0) > 0) {
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, NULL, &data_len, cr1, cr2);
+        if (ret == PARSER_OK) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int my_uart_send(void *args, const uint8_t *data, int len)
+{
+    int ret = 0;
+    if (len > 0) {
+        int fd = (int)args;
+        ret = write(fd, data, len);
+    }
+    // printf("%s send=%d sent=%d\n", __func__, len, ret);
+    return ret;
+}
+
+static int my_uart_recv(void *args, uint8_t *data, int len)
+{
+    int fd = (int)args;
+    int ret = read(fd, data, len);
+    // printf("%s recv=%d received=%d\n", __func__, len, ret);
+    return ret;
+}
+
+static int flash_download(int file_fd, int device_fd)
+{
+    int ret = 0;
+    if ((ret = get_inf(my_uart_recv, my_uart_send, (void *)(intptr_t)device_fd)) == 0) {
+        if ((ret = get_opt_rw(my_uart_recv, my_uart_send, (void *)(intptr_t)device_fd)) == 0) {
+            
+        }
+    }
+    return ret;
+}
+
+static void print_version(void)
+{
+    printf("%s version %s\n", GIT_REPO_NAME, VERSION);
+}
+
+static void print_usage(void)
+{
+    printf("Usage: %s <-d device -f file>\n", GIT_REPO_NAME);
+    printf("%s\n", "  -d <device>    Specify serial port. eg: /dev/ttyS0");
+    printf("%s\n", "  -f <file>      Specify firmware .bin file path. eg: helloworld.bin");
+    printf("\n");
+    printf("%s\n", "For bug reporting instructions, please see:");
+    printf("<%s>\n", HOMEPAGE);
+}
+
+int main(int argc, char *argv[])
+{
+    const char *shortopts = "vhd:f:";
+
+    int ch, help_flag = 0, version_flag = 0;
+    char *device = NULL, *file = NULL;
+    while ((ch = getopt(argc, argv, shortopts)) != -1) {
+        switch (ch) {
+            case 'v':
+                version_flag = 1;
+                break;
+            case 'h':
+                help_flag = 1;
+                break;
+            case 'd':
+                device = optarg;
+                break;
+            case 'f':
+                file = optarg;
+                break;
+        }
+    }
+
+    if (help_flag) {
+        print_usage();
+        return 0;
+    }
+    else if (version_flag) {
+        print_version();
+        return 0;
+    }
+    else if (!device || !file) {
+        print_usage();
+        return -1;
+    }
+
+    int file_fd;
+    if (strcmp(file, "-") == 0) {
+        file_fd = STDIN_FILENO;
+    }
+    else {
+        file_fd = open(file, O_RDONLY);
+    }
+
+    if (file_fd >= 0) {
+        int device_fd = open(device, O_RDWR | O_NOCTTY);
+        if (device_fd >= 0) {
+            struct termios termios;
+            if (tcgetattr(device_fd, &termios) == 0) {
+                cfsetispeed(&termios, B9600);
+                cfsetospeed(&termios, B9600);
+
+                termios.c_cflag |= CLOCAL | CREAD;
+                termios.c_cflag &= CSIZE;
+                termios.c_cflag |= CS8;
+                termios.c_cflag &= ~PARENB;
+                termios.c_cflag &= ~CSTOPB;
+
+                termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
+
+                if (tcsetattr(device_fd, 0, &termios) == 0) {
+                    return flash_download(file_fd, device_fd);
+                }
+            }
+        }
+    }
+
+    perror(__func__);
+    return -1;
+}
