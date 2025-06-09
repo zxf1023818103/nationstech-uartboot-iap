@@ -521,6 +521,55 @@ static int do_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_s
     return ret;
 }
 
+static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, void *firmeware_recv_args)
+{
+    int ret = 0;
+    if ((ret = get_inf(uart_recv, uart_send, uart_args)) == 0) {
+        if ((ret = get_userx_op(uart_recv, uart_send, uart_args, 0)) == 0) {
+            if ((ret = do_flash_erase(uart_recv, uart_send, uart_args, 0, NULL, 8, 256 - 8)) == 0) {
+                uint8_t cmd_data[128 + 16 + 4];
+                uint32_t flash_addr = 0x08004000;
+                for (;;) {
+                    memset(cmd_data, 0, sizeof cmd_data);
+                    int nbytesrecv = firmeware_recv(firmeware_recv_args, cmd_data + 16, 128);
+                    if (nbytesrecv > 0) {                        
+                        uint16_t data_len = nbytesrecv + 16;
+                        int last_packet = 0;
+                        if (data_len % 16) {
+                            data_len += 16 - (data_len % 16); // Align to 16 bytes
+                            last_packet = 1;
+                            printf("Warning: Data length is not a multiple of 16 bytes, padding to %d bytes.\n", data_len);
+                        }
+
+                        uint32_t crc = 0; // Initial CRC value
+                        crc = crc32_fsl(crc, cmd_data + 16, nbytesrecv); // Calculate CRC for the data
+                        uint8_t crc_bytes[4];
+                        crc_bytes[0] = crc & 0xFF;
+                        crc_bytes[1] = (crc >> 8) & 0xFF;
+                        crc_bytes[2] = (crc >> 16) & 0xFF;
+                        crc_bytes[3] = (crc >> 24) & 0xFF;
+                        memcpy(cmd_data + data_len, crc_bytes, 4); // Append CRC
+                        printf("Calculated CRC: 0x%08X\n", crc);
+                        
+                        ret = do_flash_download(uart_recv, uart_send, uart_args, 0, flash_addr, cmd_data, data_len + 4);
+                        if (ret > 0 && !last_packet) {
+                            flash_addr += nbytesrecv;
+                        }
+                        else {
+                            break;
+                        }
+                    }
+                    else {
+                        ret = nbytesrecv;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return ret;
+}
+
 static int my_uart_send(void *args, const uint8_t *data, int len)
 {
     int ret = 0;
