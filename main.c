@@ -677,7 +677,7 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
 
     if (ret >= 0) {
         if ((ret = do_data_crc_check(uart_recv, uart_send, uart_args, partition_id, key, start_flash_addr, writen_bytes, firmware_crc)) == 0) {
-            printf("Firmware download completed, total size: %d bytes, writen %d bytes, CRC32 %d bytes, CRC32 value: 0x%08X.\n", firmware_bytes, writen_bytes, crc32_bytes, firmware_crc);
+            printf("Firmware download completed, total size: %d bytes, writen %d bytes, CRC32 calculated %d bytes, CRC32 value: 0x%08X.\n", firmware_bytes, writen_bytes, crc32_bytes, firmware_crc);
         }
     }
     else {
