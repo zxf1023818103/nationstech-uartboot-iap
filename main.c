@@ -49,6 +49,14 @@ struct resp_userx_op {
     uint8_t encrypted : 4;
 };
 
+struct resp_flash_erase {
+    uint8_t dummy;
+};
+
+struct resp_flash_download {
+    uint8_t dummy;
+};
+
 #pragma pack()
 
 enum parser_state {
@@ -301,7 +309,7 @@ static int get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void 
                 printf("%02X", resp_inf->chip_id[i]);
             }
             printf("\n");
-            printf("Debug MCU ID Code: ");
+            printf("MCU Device ID Code: ");
             for (int i = 0; i < sizeof(resp_inf->dbgmcu_idcode); i++) {
                 printf("%02X", resp_inf->dbgmcu_idcode[i]);
             }
@@ -423,19 +431,94 @@ static int get_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, vo
     }
 }
 
-static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size, uint8_t *cr1, uint8_t *cr2)
 {
     uint8_t cmd_h = 0, cmd_l = 0;
     uint16_t data_len = 0;
 
-    if (send_cmd(uart_send, args, CMD_FLASH_ERASE, 0, (uint8_t[4]){partition_id}, NULL, 0) > 0) {
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, NULL, &data_len, cr1, cr2);
+    uint8_t start_page_l = start_page & 0xFF;
+    uint8_t start_page_h = (start_page >> 8) & 0xFF;
+    uint8_t page_size_l = page_size & 0xFF;
+    uint8_t page_size_h = (page_size >> 8) & 0xFF;
+    uint8_t key_copy[16] = {0};
+
+    if (key) {
+        memcpy(key_copy, key, 16);
+    }
+
+    struct resp_flash_erase *resp_flash_erase = NULL;
+
+    if (send_cmd(uart_send, args, CMD_FLASH_ERASE, partition_id, (uint8_t[4]){start_page_l, start_page_h, page_size_l, page_size_h}, key_copy, 16) > 0) {
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)&resp_flash_erase, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
     }
 
     return -1;
+}
+
+static int do_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size)
+{
+    int ret = 0;
+    uint8_t cr1 = 0, cr2 = 0;
+
+    if (send_cmd_flash_erase(uart_recv, uart_send, args, partition_id, key, start_page, page_size, &cr1, &cr2) == 0) {
+        if (cr1 == 0xA0 && cr2 == 0x00) {
+            printf("Flash erased 0x%08X - 0x%08X\n", 0x08000000 + (start_page * 0x800), 0x08000000 + ((start_page + page_size) * 0x800));
+        } else {
+            printf("%s: Unexpected response: cr1=0x%02X, cr2=0x%02X\n", __func__, cr1, cr2);
+            ret = -1;
+        }
+    } else {
+        printf("%s: Failed to send flash erase command.\n", __func__);
+        ret = -1;
+    }
+
+    return ret;
+}
+
+static int send_cmd_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint32_t addr, uint8_t *cmd_data, uint16_t cmd_data_len, uint8_t *cr1, uint8_t *cr2)
+{
+    uint8_t cmd_h = 0, cmd_l = 0;
+    uint16_t data_len = 0;
+
+    uint8_t flash_addr[4];
+    flash_addr[0] = addr & 0xFF;
+    flash_addr[1] = (addr >> 8) & 0xFF;
+    flash_addr[2] = (addr >> 16) & 0xFF;
+    flash_addr[3] = (addr >> 24) & 0xFF;
+
+    struct resp_flash_download *resp_flash_download = NULL;
+
+    if (send_cmd(uart_send, args, CMD_FLASH_DWNLD, partition_id, flash_addr, cmd_data, cmd_data_len) > 0) {
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)&resp_flash_download, &data_len, cr1, cr2);
+        if (ret == PARSER_OK) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int do_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint32_t flash_addr, uint8_t *data, uint16_t data_len)
+{
+    int ret = 0;
+    uint8_t cr1 = 0, cr2 = 0;
+
+    printf("Flash download %d bytes to 0x%08X\n", data_len - 16 - 4, flash_addr);
+    if (send_cmd_flash_download(uart_recv, uart_send, args, partition_id, flash_addr, data, data_len, &cr1, &cr2) == 0) {
+        if (cr1 == 0xA0 && cr2 == 0x00) {
+        } else {
+            printf("%s: Unexpected response: cr1=0x%02X, cr2=0x%02X\n", __func__, cr1, cr2);
+            ret = -1;
+        }
+    } else {
+        printf("%s: Failed to send flash download command.\n", __func__);
+        ret = -1;
+    }
+
+    return ret;
 }
 
 static int my_uart_send(void *args, const uint8_t *data, int len)
@@ -457,15 +540,13 @@ static int my_uart_recv(void *args, uint8_t *data, int len)
     return ret;
 }
 
-static int flash_download(int file_fd, int device_fd)
+static int my_firmware_recv(void *args, uint8_t *data, int len)
 {
-    int ret = 0;
-    if ((ret = get_inf(my_uart_recv, my_uart_send, (void *)(intptr_t)device_fd)) == 0) {
-        if ((ret = get_opt_rw(my_uart_recv, my_uart_send, (void *)(intptr_t)device_fd)) == 0) {
-            
-        }
+    int fd = (int)args;
+    if (len > 0) {
+        return read(fd, data, len);
     }
-    return ret;
+    return 0;
 }
 
 static void print_version(void)
@@ -544,7 +625,7 @@ int main(int argc, char *argv[])
                 termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
 
                 if (tcsetattr(device_fd, 0, &termios) == 0) {
-                    return flash_download(file_fd, device_fd);
+                    return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, (void *)(intptr_t)file_fd);
                 }
             }
         }

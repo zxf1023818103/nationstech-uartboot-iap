@@ -2,6 +2,7 @@
     "files.associations": {
         "termios.h": "c",
         "getopt.h": "c",
-        "termios-baud.h": "c"
+        "termios-baud.h": "c",
+        "cstdlib": "c"
     }
 }

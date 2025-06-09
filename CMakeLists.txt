@@ -60,6 +60,7 @@ add_compile_definitions(GIT_TAG="${GIT_TAG}")
 add_compile_definitions(VERSION="${CPACK_PACKAGE_VERSION}")
 add_compile_definitions(HOMEPAGE="${HOMEPAGE}")
 
-add_compile_options(-Wno-pointer-to-int-cast)
+add_compile_options(-Wno-pointer-to-int-cast -fsanitize=address)
+add_link_options(-fsanitize=address)
 
 add_executable(nationstech-uartboot-iap main.c)
