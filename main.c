@@ -61,6 +61,10 @@ struct resp_data_crc_check {
     uint8_t dummy;
 };
 
+struct resp_sys_reset {
+    uint8_t dummy;
+};
+
 #pragma pack()
 
 enum parser_state {
@@ -430,6 +434,10 @@ static int get_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, vo
             ret = -1;
         }
     }
+    else {
+        printf("%s: Failed to get option read/write info.\n", __func__);
+        ret = -1;
+    }
 }
 
 static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size, uint8_t *cr1, uint8_t *cr2)
@@ -635,10 +643,6 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
             }
             writen_bytes += data_len - 16;
             uint32_t crc = ns_crc32(0xffffffff, cmd_data + 16, data_len - 16);
-            // uint32_t crc = 0xffffffff;
-            // for (int i = 0; i < data_len - 16; i += 4) {
-            //     crc = ns_crc32(crc, cmd_data + 16 + i, 4);
-            // }
             firmware_crc = ns_crc32(firmware_crc, cmd_data + 16, data_len - 16);
             
             uint8_t crc_bytes[4];
@@ -687,6 +691,42 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
     return ret;
 }
 
+static int send_cmd_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, struct resp_sys_reset **resp, uint8_t *cr1, uint8_t *cr2)
+{
+    if (send_cmd(uart_send, args, CMD_SYS_RESET, 0, (uint8_t[4]){0}, NULL, 0) > 0) {
+        uint8_t cmd_h = 0, cmd_l = 0;
+        uint16_t data_len = 0;
+        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        if (ret == PARSER_OK) {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int do_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args)
+{
+    int ret = 0;
+    uint8_t cr1 = 0, cr2 = 0;
+
+    struct resp_sys_reset *resp = NULL;
+    if (send_cmd_sys_reset(uart_recv, uart_send, args, &resp, &cr1, &cr2) == 0) {
+        if (cr1 == 0xA0 && cr2 == 0x00) {
+            printf("System reset command sent successfully.\n");
+            // Note: The device will reset, so we won't receive any further responses.
+        } else {
+            printf("%s: Unexpected response: cr1=0x%02X, cr2=0x%02X\n", __func__, cr1, cr2);
+            ret = -1;
+        }
+    } else {
+        printf("%s: Failed to send system reset command.\n", __func__);
+        ret = -1;
+    }
+
+    return ret;
+}
+
 static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, void *firmeware_recv_args, uint8_t partition_id, uint8_t *key, uint32_t flash_addr)
 {
     int ret = 0;
@@ -694,7 +734,7 @@ static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send
         if ((ret = get_userx_op(uart_recv, uart_send, uart_args, 0)) == 0) {
             if ((ret = do_flash_erase(uart_recv, uart_send, uart_args, 0, NULL, 0, 256)) == 0) {
                 if ((ret = do_firmware_download(uart_recv, uart_send, firmeware_recv, uart_args, firmeware_recv_args, partition_id, key, flash_addr)) == 0) {
-                    
+                    ret = do_sys_reset(uart_recv, uart_send, uart_args);
                 }
             }
         }
