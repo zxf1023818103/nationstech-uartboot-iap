@@ -727,14 +727,44 @@ static int do_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, 
     return ret;
 }
 
-static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, void *firmeware_recv_args, uint8_t partition_id, uint8_t *key, uint32_t flash_addr)
+static int do_boot_flag_write(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint32_t boot_flag_addr, uint32_t boot_flag)
+{
+    uint8_t cmd_data[16 + 16 + 4];
+    memset(cmd_data, 0xff, sizeof cmd_data);
+    if (key) {
+        memcpy(cmd_data, key, 16);
+    }
+    memcpy(cmd_data + 16, &boot_flag, sizeof boot_flag);
+
+    uint32_t crc = ns_crc32(0xffffffff, cmd_data + 16, 16);
+            
+    uint8_t crc_bytes[4];
+    crc_bytes[0] = crc & 0xFF;
+    crc_bytes[1] = (crc >> 8) & 0xFF;
+    crc_bytes[2] = (crc >> 16) & 0xFF;
+    crc_bytes[3] = (crc >> 24) & 0xFF;
+    memcpy(cmd_data + 32, crc_bytes, 4); // Append CRC
+
+    if (do_flash_download(uart_recv, uart_send, args, partition_id, boot_flag_addr, cmd_data, sizeof cmd_data) >= 0) {
+        printf("Write boot flag 0x%08X.\n", boot_flag);
+        return 0;
+    }
+    else {
+        printf("Failed to write boot flag 0x%08X.\n", boot_flag);
+        return -1;
+    }
+}
+
+static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, void *firmeware_recv_args, uint8_t partition_id, uint8_t *key, uint32_t flash_addr, uint32_t boot_flag_addr)
 {
     int ret = 0;
     if ((ret = get_inf(uart_recv, uart_send, uart_args)) == 0) {
         if ((ret = get_userx_op(uart_recv, uart_send, uart_args, 0)) == 0) {
-            if ((ret = do_flash_erase(uart_recv, uart_send, uart_args, 0, NULL, 0, 256)) == 0) {
+            if ((ret = do_flash_erase(uart_recv, uart_send, uart_args, 0, NULL, 5, 256 - 5)) == 0) {
                 if ((ret = do_firmware_download(uart_recv, uart_send, firmeware_recv, uart_args, firmeware_recv_args, partition_id, key, flash_addr)) == 0) {
-                    ret = do_sys_reset(uart_recv, uart_send, uart_args);
+                    if ((ret = do_boot_flag_write(uart_recv, uart_send, uart_args, partition_id, key, boot_flag_addr, 0x12345678)) == 0) {
+                        ret = do_sys_reset(uart_recv, uart_send, uart_args);
+                    }
                 }
             }
         }
@@ -846,7 +876,7 @@ int main(int argc, char *argv[])
                 termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
 
                 if (tcsetattr(device_fd, 0, &termios) == 0) {
-                    return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, (void *)(intptr_t)file_fd, 0, NULL, 0x08000000);
+                    return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, (void *)(intptr_t)file_fd, 0, NULL, 0x08003000, 0x08002800);
                 }
             }
         }
