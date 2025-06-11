@@ -8,6 +8,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 
 #define CMD_GET_INF 0x10
 #define CMD_GET_RNG 0x20
@@ -89,8 +90,8 @@ enum parser_ret {
 };
 
 typedef int (*uart_send_func_t)(void *args, const uint8_t *data, int len);
-typedef int (*uart_recv_func_t)(void *args, uint8_t *data, int len);
-typedef int (*firmeware_recv_func_t)(void *args, uint8_t *data, int len);
+typedef int (*uart_recv_func_t)(void *args, uint8_t *data, int len, uint32_t uart_idle_timeout_sec);
+typedef int (*firmeware_recv_func_t)(void *args, uint8_t *data, int len, uint32_t firmware_recv_timeout_sec);
 
 static const char *parser_state_to_string(enum parser_state state)
 {
@@ -121,11 +122,11 @@ static const char *parser_ret_to_string(int ret)
     }
 }
 
-static enum parser_ret parse_one_byte(uart_recv_func_t uart_recv, void *args, uint8_t *cmd_h, uint8_t *cmd_l, uint8_t *data, uint16_t *data_len, uint8_t *cr1, uint8_t *cr2,
+static enum parser_ret parse_one_byte(uart_recv_func_t uart_recv, void *args, uint32_t uart_idle_timeout_sec, uint8_t *cmd_h, uint8_t *cmd_l, uint8_t *data, uint16_t *data_len, uint8_t *cr1, uint8_t *cr2,
                         enum parser_state *state, uint16_t *current_data_len, uint8_t *current_checksum, uint8_t *checksum)
 {
     uint8_t input;
-    if (uart_recv(args, &input, 1) < 0) {
+    if (uart_recv(args, &input, 1, uart_idle_timeout_sec) < 0) {
         return PARSER_UART_ERROR; // Error or no data received
     }
 
@@ -227,7 +228,7 @@ static enum parser_ret parse_one_byte(uart_recv_func_t uart_recv, void *args, ui
     return ret;
 }
 
-static enum parser_ret recv_next_packet(uart_recv_func_t uart_recv, void *args, uint8_t *cmd_h, uint8_t *cmd_l, uint8_t **data, uint16_t *data_len, uint8_t *cr1, uint8_t *cr2)
+static enum parser_ret recv_next_packet(uart_recv_func_t uart_recv, void *args, uint32_t uart_idle_timeout_sec, uint8_t *cmd_h, uint8_t *cmd_l, uint8_t **data, uint16_t *data_len, uint8_t *cr1, uint8_t *cr2)
 {
     enum parser_state state = STATE_HEADER1;
     uint16_t current_data_len = 0;
@@ -235,7 +236,7 @@ static enum parser_ret recv_next_packet(uart_recv_func_t uart_recv, void *args, 
     uint8_t checksum = 0;
 
     while (1) {
-        enum parser_ret parse_ret = parse_one_byte(uart_recv, args, cmd_h, cmd_l, *data, data_len, cr1, cr2, &state, &current_data_len, &current_checksum, &checksum);
+        enum parser_ret parse_ret = parse_one_byte(uart_recv, args, uart_idle_timeout_sec, cmd_h, cmd_l, *data, data_len, cr1, cr2, &state, &current_data_len, &current_checksum, &checksum);
         if (parse_ret != PARSER_MORE_DATA_REQUIRED) {
             return parse_ret;
         }
@@ -281,12 +282,12 @@ static int send_cmd(uart_send_func_t uart_send, void *args, uint8_t cmd_h, uint8
     return -1;
 }
 
-static int send_cmd_get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, struct resp_get_inf **resp, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, struct resp_get_inf **resp, uint8_t *cr1, uint8_t *cr2)
 {
     if (send_cmd(uart_send, args, CMD_GET_INF, 0, (uint8_t[4]){0}, NULL, 0) > 0) {
         uint8_t cmd_h = 0, cmd_l = 0;
         uint16_t data_len = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -295,13 +296,13 @@ static int send_cmd_get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_se
     return -1;
 }
 
-static int get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args)
+static int get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec)
 {
     int ret = 0;
 
     struct resp_get_inf *resp_inf = NULL;
     uint8_t cr1 = 0, cr2 = 0;
-    if (send_cmd_get_inf(uart_recv, uart_send, args, &resp_inf, &cr1, &cr2) == 0) {
+    if (send_cmd_get_inf(uart_recv, uart_send, args, uart_idle_timeout_sec, &resp_inf, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("Device Model ID: %d\n", resp_inf->model_id);
             printf("Boot Command Version: %d.%d\n", resp_inf->bootcmd_version_major, resp_inf->bootcmd_version_minor);
@@ -338,12 +339,12 @@ static int get_inf(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void 
     return ret;
 }
 
-static int send_cmd_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, struct resp_userx_op **resp, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, struct resp_userx_op **resp, uint8_t *cr1, uint8_t *cr2)
 {
     if (send_cmd(uart_send, args, CMD_USERX_OP, 0, (uint8_t[4]){partition_id}, NULL, 0) > 0) {
         uint8_t cmd_h = 0, cmd_l = 0;
         uint16_t data_len = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -352,13 +353,13 @@ static int send_cmd_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_s
     return -1;
 }
 
-static int get_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id)
+static int get_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id)
 {
     int ret = 0;
 
     struct resp_userx_op *resp_userx_op = NULL;
     uint8_t cr1 = 0, cr2 = 0;
-    if (send_cmd_userx_op(uart_recv, uart_send, args, partition_id, &resp_userx_op, &cr1, &cr2) == 0) {
+    if (send_cmd_userx_op(uart_recv, uart_send, args, uart_idle_timeout_sec, partition_id, &resp_userx_op, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("Partition ID: USER%d\n", resp_userx_op->partition_id + 1);
             if (resp_userx_op->partition_16k_bytes) {
@@ -387,13 +388,13 @@ static int get_userx_op(uart_recv_func_t uart_recv, uart_send_func_t uart_send, 
     return ret;
 }
 
-static int send_cmd_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, struct resp_opt_rw **resp, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, struct resp_opt_rw **resp, uint8_t *cr1, uint8_t *cr2)
 {
     uint8_t data[20] = {0};
     if (send_cmd(uart_send, args, CMD_OPT_RW, 0, (uint8_t[4]){0}, data, sizeof data) > 0) {
         uint8_t cmd_h = 0, cmd_l = 0;
         uint16_t data_len = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -402,13 +403,13 @@ static int send_cmd_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_sen
     return -1;
 }
 
-static int get_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args)
+static int get_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec)
 {
     int ret = 0;
 
     struct resp_opt_rw *resp_opt_rw = NULL;
     uint8_t cr1 = 0, cr2 = 0;
-    if (send_cmd_opt_rw(uart_recv, uart_send, args, &resp_opt_rw, &cr1, &cr2) == 0) {
+    if (send_cmd_opt_rw(uart_recv, uart_send, args, uart_idle_timeout_sec, &resp_opt_rw, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("RDP: %d\n", resp_opt_rw->RDP);
             printf("nRDP: %d\n", resp_opt_rw->nRDP);
@@ -440,7 +441,7 @@ static int get_opt_rw(uart_recv_func_t uart_recv, uart_send_func_t uart_send, vo
     }
 }
 
-static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size, uint8_t *cr1, uint8_t *cr2)
 {
     uint8_t start_page_l = start_page & 0xFF;
     uint8_t start_page_h = (start_page >> 8) & 0xFF;
@@ -458,7 +459,7 @@ static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uar
     if (send_cmd(uart_send, args, CMD_FLASH_ERASE, partition_id, par, data, sizeof data) > 0) {
         uint8_t cmd_h = 0, cmd_l = 0;
         uint16_t data_len = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)&resp_flash_erase, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)&resp_flash_erase, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -467,12 +468,12 @@ static int send_cmd_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uar
     return -1;
 }
 
-static int do_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size)
+static int do_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint8_t *key, uint16_t start_page, uint16_t page_size)
 {
     int ret = 0;
     uint8_t cr1 = 0, cr2 = 0;
 
-    if (send_cmd_flash_erase(uart_recv, uart_send, args, partition_id, key, start_page, page_size, &cr1, &cr2) == 0) {
+    if (send_cmd_flash_erase(uart_recv, uart_send, args, uart_idle_timeout_sec, partition_id, key, start_page, page_size, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("Flash erased 0x%08X - 0x%08X\n", 0x08000000 + (start_page * 0x800), 0x08000000 + ((start_page + page_size) * 0x800));
         } else {
@@ -487,7 +488,7 @@ static int do_flash_erase(uart_recv_func_t uart_recv, uart_send_func_t uart_send
     return ret;
 }
 
-static int send_cmd_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint32_t addr, uint8_t *cmd_data, uint16_t cmd_data_len, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint32_t addr, uint8_t *cmd_data, uint16_t cmd_data_len, uint8_t *cr1, uint8_t *cr2)
 {
     uint8_t flash_addr[4];
     flash_addr[0] = addr & 0xFF;
@@ -500,7 +501,7 @@ static int send_cmd_flash_download(uart_recv_func_t uart_recv, uart_send_func_t 
     if (send_cmd(uart_send, args, CMD_FLASH_DWNLD, partition_id, flash_addr, cmd_data, cmd_data_len) > 0) {
         uint16_t data_len = 0;
         uint8_t cmd_h = 0, cmd_l = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)&resp_flash_download, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)&resp_flash_download, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -509,12 +510,12 @@ static int send_cmd_flash_download(uart_recv_func_t uart_recv, uart_send_func_t 
     return -1;
 }
 
-static int do_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint32_t flash_addr, uint8_t *data, uint16_t data_len)
+static int do_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint32_t flash_addr, uint8_t *data, uint16_t data_len)
 {
     int ret = 0;
     uint8_t cr1 = 0, cr2 = 0;
 
-    if (send_cmd_flash_download(uart_recv, uart_send, args, partition_id, flash_addr, data, data_len, &cr1, &cr2) == 0) {
+    if (send_cmd_flash_download(uart_recv, uart_send, args, uart_idle_timeout_sec, partition_id, flash_addr, data, data_len, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("Flash downloaded %d bytes to 0x%08X\n", data_len - 16 - 4, flash_addr);
         } else {
@@ -529,7 +530,7 @@ static int do_flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_s
     return ret;
 }
 
-static int send_cmd_data_crc_check(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint32_t start_addr, uint32_t size, uint32_t crc, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_data_crc_check(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint8_t *key, uint32_t start_addr, uint32_t size, uint32_t crc, uint8_t *cr1, uint8_t *cr2)
 {
     uint8_t cmd_h = 0, cmd_l = 0;
     uint8_t data[16 + 4 + 4] = { 0 };
@@ -554,7 +555,7 @@ static int send_cmd_data_crc_check(uart_recv_func_t uart_recv, uart_send_func_t 
     struct resp_data_crc_check *resp_data_crc_check = NULL;
     if (send_cmd(uart_send, args, CMD_DATA_CRC_CHECK, partition_id, crc_bytes, data, sizeof data) > 0) {
         uint16_t data_len = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)&resp_data_crc_check, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)&resp_data_crc_check, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -563,12 +564,12 @@ static int send_cmd_data_crc_check(uart_recv_func_t uart_recv, uart_send_func_t 
     return -1;
 }
 
-static int do_data_crc_check(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint32_t start_addr, uint32_t size, uint32_t crc)
+static int do_data_crc_check(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint8_t *key, uint32_t start_addr, uint32_t size, uint32_t crc)
 {
     int ret = 0;
     uint8_t cr1 = 0, cr2 = 0;
 
-    if (send_cmd_data_crc_check(uart_recv, uart_send, args, partition_id, key, start_addr, size, crc, &cr1, &cr2) == 0) {
+    if (send_cmd_data_crc_check(uart_recv, uart_send, args, uart_idle_timeout_sec, partition_id, key, start_addr, size, crc, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("Checksum OK.\n");
         } else {
@@ -619,7 +620,7 @@ uint32_t ns_crc32(uint32_t initial_crc, const uint8_t *data, uint32_t len)
     return crc;
 }
 
-static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, void *firmeware_recv_args, uint8_t partition_id, uint8_t *key, uint32_t flash_addr)
+static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, uint32_t uart_idle_timeout_sec, void *firmeware_recv_args, uint32_t firmware_recv_timeout_sec, uint8_t partition_id, uint8_t *key, uint32_t flash_addr)
 {
     int ret = 0;
     uint8_t cmd_data[128 + 16 + 4];
@@ -632,7 +633,7 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
     uint32_t firmware_crc = 0xffffffff;
     for (;;) {
         memset(cmd_data, 0xff, sizeof cmd_data);
-        int nbytesrecv = firmeware_recv(firmeware_recv_args, cmd_data + 16, 128);
+        int nbytesrecv = firmeware_recv(firmeware_recv_args, cmd_data + 16, 128, firmware_recv_timeout_sec);
         if (nbytesrecv > 0) {
             firmware_bytes += nbytesrecv;
             uint16_t data_len = nbytesrecv + 16;
@@ -652,7 +653,7 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
             crc_bytes[3] = (crc >> 24) & 0xFF;
             memcpy(cmd_data + data_len, crc_bytes, 4); // Append CRC
             
-            ret = do_flash_download(uart_recv, uart_send, uart_args, partition_id, flash_addr, cmd_data, data_len + 4);
+            ret = do_flash_download(uart_recv, uart_send, uart_args, uart_idle_timeout_sec, partition_id, flash_addr, cmd_data, data_len + 4);
             if (ret >= 0 && !last_packet) {
                 flash_addr += nbytesrecv;
             }
@@ -680,7 +681,7 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
     }
 
     if (ret >= 0) {
-        if ((ret = do_data_crc_check(uart_recv, uart_send, uart_args, partition_id, key, start_flash_addr, writen_bytes, firmware_crc)) == 0) {
+        if ((ret = do_data_crc_check(uart_recv, uart_send, uart_args, uart_idle_timeout_sec, partition_id, key, start_flash_addr, writen_bytes, firmware_crc)) == 0) {
             printf("Firmware download completed, total size: %d bytes, writen %d bytes, CRC32 calculated %d bytes, CRC32 value: 0x%08X.\n", firmware_bytes, writen_bytes, crc32_bytes, firmware_crc);
         }
     }
@@ -691,12 +692,12 @@ static int do_firmware_download(uart_recv_func_t uart_recv, uart_send_func_t uar
     return ret;
 }
 
-static int send_cmd_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, struct resp_sys_reset **resp, uint8_t *cr1, uint8_t *cr2)
+static int send_cmd_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, struct resp_sys_reset **resp, uint8_t *cr1, uint8_t *cr2)
 {
     if (send_cmd(uart_send, args, CMD_SYS_RESET, 0, (uint8_t[4]){0}, NULL, 0) > 0) {
         uint8_t cmd_h = 0, cmd_l = 0;
         uint16_t data_len = 0;
-        enum parser_ret ret = recv_next_packet(uart_recv, args, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
+        enum parser_ret ret = recv_next_packet(uart_recv, args, uart_idle_timeout_sec, &cmd_h, &cmd_l, (uint8_t**)resp, &data_len, cr1, cr2);
         if (ret == PARSER_OK) {
             return 0;
         }
@@ -705,13 +706,13 @@ static int send_cmd_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_
     return -1;
 }
 
-static int do_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args)
+static int do_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec)
 {
     int ret = 0;
     uint8_t cr1 = 0, cr2 = 0;
 
     struct resp_sys_reset *resp = NULL;
-    if (send_cmd_sys_reset(uart_recv, uart_send, args, &resp, &cr1, &cr2) == 0) {
+    if (send_cmd_sys_reset(uart_recv, uart_send, args, uart_idle_timeout_sec, &resp, &cr1, &cr2) == 0) {
         if (cr1 == 0xA0 && cr2 == 0x00) {
             printf("System reset command sent successfully.\n");
             // Note: The device will reset, so we won't receive any further responses.
@@ -727,7 +728,7 @@ static int do_sys_reset(uart_recv_func_t uart_recv, uart_send_func_t uart_send, 
     return ret;
 }
 
-static int do_boot_flag_write(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint8_t partition_id, uint8_t *key, uint32_t boot_flag_addr, uint32_t boot_flag)
+static int do_boot_flag_write(uart_recv_func_t uart_recv, uart_send_func_t uart_send, void *args, uint32_t uart_idle_timeout_sec, uint8_t partition_id, uint8_t *key, uint32_t boot_flag_addr, uint32_t boot_flag)
 {
     uint8_t cmd_data[16 + 16 + 4];
     memset(cmd_data, 0xff, sizeof cmd_data);
@@ -745,7 +746,7 @@ static int do_boot_flag_write(uart_recv_func_t uart_recv, uart_send_func_t uart_
     crc_bytes[3] = (crc >> 24) & 0xFF;
     memcpy(cmd_data + 32, crc_bytes, 4); // Append CRC
 
-    if (do_flash_download(uart_recv, uart_send, args, partition_id, boot_flag_addr, cmd_data, sizeof cmd_data) >= 0) {
+    if (do_flash_download(uart_recv, uart_send, args, uart_idle_timeout_sec, partition_id, boot_flag_addr, cmd_data, sizeof cmd_data) >= 0) {
         printf("Write boot flag 0x%08X.\n", boot_flag);
         return 0;
     }
@@ -755,15 +756,15 @@ static int do_boot_flag_write(uart_recv_func_t uart_recv, uart_send_func_t uart_
     }
 }
 
-static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, void *firmeware_recv_args, uint8_t partition_id, uint8_t *key, uint32_t flash_addr, uint32_t boot_flag_addr)
+static int flash_download(uart_recv_func_t uart_recv, uart_send_func_t uart_send, firmeware_recv_func_t firmeware_recv, void *uart_args, uint32_t uart_idle_timeout_sec, void *firmeware_recv_args, uint32_t firmware_recv_timeout_sec, uint8_t partition_id, uint8_t *key, uint32_t flash_addr, uint32_t boot_flag_addr)
 {
     int ret = 0;
-    if ((ret = get_inf(uart_recv, uart_send, uart_args)) == 0) {
-        if ((ret = get_userx_op(uart_recv, uart_send, uart_args, 0)) == 0) {
-            if ((ret = do_flash_erase(uart_recv, uart_send, uart_args, 0, NULL, 5, 256 - 5)) == 0) {
-                if ((ret = do_firmware_download(uart_recv, uart_send, firmeware_recv, uart_args, firmeware_recv_args, partition_id, key, flash_addr)) == 0) {
-                    if ((ret = do_boot_flag_write(uart_recv, uart_send, uart_args, partition_id, key, boot_flag_addr, 0x12345678)) == 0) {
-                        ret = do_sys_reset(uart_recv, uart_send, uart_args);
+    if ((ret = get_inf(uart_recv, uart_send, uart_args, uart_idle_timeout_sec)) == 0) {
+        if ((ret = get_userx_op(uart_recv, uart_send, uart_args, uart_idle_timeout_sec, 0)) == 0) {
+            if ((ret = do_flash_erase(uart_recv, uart_send, uart_args, uart_idle_timeout_sec, 0, NULL, 5, 256 - 5)) == 0) {
+                if ((ret = do_firmware_download(uart_recv, uart_send, firmeware_recv, uart_args, uart_idle_timeout_sec, firmeware_recv_args, firmware_recv_timeout_sec, partition_id, key, flash_addr)) == 0) {
+                    if ((ret = do_boot_flag_write(uart_recv, uart_send, uart_args, uart_idle_timeout_sec, partition_id, key, boot_flag_addr, 0x12345678)) == 0) {
+                        ret = do_sys_reset(uart_recv, uart_send, uart_args, uart_idle_timeout_sec);
                     }
                 }
             }
@@ -783,21 +784,48 @@ static int my_uart_send(void *args, const uint8_t *data, int len)
     return ret;
 }
 
-static int my_uart_recv(void *args, uint8_t *data, int len)
+static int my_uart_recv(void *args, uint8_t *data, int len, uint32_t uart_idle_timeout_sec)
 {
+    int ret = -1;
     int fd = (int)args;
-    int ret = read(fd, data, len);
-    // printf("%s recv=%d received=%d\n", __func__, len, ret);
+
+    struct timeval tm = {
+        .tv_sec = uart_idle_timeout_sec,
+    };
+
+    fd_set read_fds;
+    FD_SET(fd, &read_fds);
+    int nfds = select(fd, &read_fds, NULL, NULL, &tm);
+    if (nfds > 0 && FD_ISSET(fd, &read_fds)) {
+        ret = read(fd, data, len);
+        // printf("%s recv=%d received=%d\n", __func__, len, ret);
+    }
+    else {
+        printf("%s(): recv timeout.\n", __func__);
+    }
     return ret;
 }
 
-static int my_firmware_recv(void *args, uint8_t *data, int len)
+static int my_firmware_recv(void *args, uint8_t *data, int len, uint32_t firmware_recv_timeout_sec)
 {
+    int ret = -1;
     int fd = (int)args;
-    if (len > 0) {
-        return read(fd, data, len);
+
+    struct timeval tm = {
+        .tv_sec = firmware_recv_timeout_sec,
+    };
+
+    fd_set read_fds;
+    FD_SET(fd, &read_fds);
+    int nfds = select(fd, &read_fds, NULL, NULL, &tm);
+    if (nfds > 0 && FD_ISSET(fd, &read_fds)) {
+        ret = read(fd, data, len);
+        // printf("%s recv=%d received=%d\n", __func__, len, ret);
     }
-    return 0;
+    else {
+        printf("%s(): recv timeout.\n", __func__);
+    }
+    return ret;
 }
 
 static void print_version(void)
@@ -876,7 +904,7 @@ int main(int argc, char *argv[])
                 termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
 
                 if (tcsetattr(device_fd, 0, &termios) == 0) {
-                    return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, (void *)(intptr_t)file_fd, 0, NULL, 0x08003000, 0x08002800);
+                    return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, 2, (void *)(intptr_t)file_fd, 2, 0, NULL, 0x08003000, 0x08002800);
                 }
             }
         }
