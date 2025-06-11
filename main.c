@@ -795,13 +795,13 @@ static int my_uart_recv(void *args, uint8_t *data, int len, uint32_t uart_idle_t
 
     fd_set read_fds;
     FD_SET(fd, &read_fds);
-    int nfds = select(fd, &read_fds, NULL, NULL, &tm);
+    int nfds = select(fd + 1, &read_fds, NULL, NULL, &tm);
     if (nfds > 0 && FD_ISSET(fd, &read_fds)) {
         ret = read(fd, data, len);
         // printf("%s recv=%d received=%d\n", __func__, len, ret);
     }
     else {
-        printf("%s(): recv timeout.\n", __func__);
+        printf("%s(): recv timeout %u.\n", __func__, uart_idle_timeout_sec);
     }
     return ret;
 }
@@ -815,15 +815,15 @@ static int my_firmware_recv(void *args, uint8_t *data, int len, uint32_t firmwar
         .tv_sec = firmware_recv_timeout_sec,
     };
 
-    fd_set read_fds;
+    fd_set read_fds = { 0 };
     FD_SET(fd, &read_fds);
-    int nfds = select(fd, &read_fds, NULL, NULL, &tm);
+    int nfds = select(fd + 1, &read_fds, NULL, NULL, &tm);
     if (nfds > 0 && FD_ISSET(fd, &read_fds)) {
         ret = read(fd, data, len);
         // printf("%s recv=%d received=%d\n", __func__, len, ret);
     }
     else {
-        printf("%s(): recv timeout.\n", __func__);
+        printf("%s(): recv timeout %u.\n", __func__, firmware_recv_timeout_sec);
     }
     return ret;
 }
@@ -888,23 +888,26 @@ int main(int argc, char *argv[])
     }
 
     if (file_fd >= 0) {
-        int device_fd = open(device, O_RDWR | O_NOCTTY);
-        if (device_fd >= 0) {
-            struct termios termios;
-            if (tcgetattr(device_fd, &termios) == 0) {
-                cfsetispeed(&termios, B9600);
-                cfsetospeed(&termios, B9600);
+        int ret = fcntl(file_fd, F_SETFD, O_NONBLOCK);
+        if (ret >= 0) {
+            int device_fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+            if (device_fd >= 0) {
+                struct termios termios;
+                if (tcgetattr(device_fd, &termios) == 0) {
+                    cfsetispeed(&termios, B9600);
+                    cfsetospeed(&termios, B9600);
 
-                termios.c_cflag |= CLOCAL | CREAD;
-                termios.c_cflag &= CSIZE;
-                termios.c_cflag |= CS8;
-                termios.c_cflag &= ~PARENB;
-                termios.c_cflag &= ~CSTOPB;
+                    termios.c_cflag |= CLOCAL | CREAD;
+                    termios.c_cflag &= CSIZE;
+                    termios.c_cflag |= CS8;
+                    termios.c_cflag &= ~PARENB;
+                    termios.c_cflag &= ~CSTOPB;
 
-                termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
+                    termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
 
-                if (tcsetattr(device_fd, 0, &termios) == 0) {
-                    return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, 2, (void *)(intptr_t)file_fd, 2, 0, NULL, 0x08003000, 0x08002800);
+                    if (tcsetattr(device_fd, 0, &termios) == 0) {
+                        return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, 2, (void *)(intptr_t)file_fd, 2, 0, NULL, 0x08003000, 0x08002800);
+                    }
                 }
             }
         }
