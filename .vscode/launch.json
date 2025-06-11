@@ -9,10 +9,20 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/nationstech-uartboot-iap",
-            "args": ["-d", "/dev/ttyACM0", "-f", "Printf.bin"],
-            "stopAtEntry": true,
+            "args": [
+                "-d",
+                "/dev/ttyACM1",
+                "-f",
+                "Printf.bin"
+            ],
+            "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "environment": [],
+            "environment": [
+                {
+                    "name": "LSAN_OPTIONS",
+                    "value": "verbosity=1:log_threads=1"
+                }
+            ],
             "externalConsole": false,
             "MIMode": "gdb",
             "setupCommands": [
@@ -28,6 +38,5 @@
                 }
             ]
         }
-
     ]
 }

@@ -7,6 +7,7 @@
 #include <termios.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/select.h>
 
@@ -887,8 +888,9 @@ int main(int argc, char *argv[])
         file_fd = open(file, O_RDONLY);
     }
 
+    int ret = -1;
     if (file_fd >= 0) {
-        int ret = fcntl(file_fd, F_SETFD, O_NONBLOCK);
+        ret = fcntl(file_fd, F_SETFD, O_NONBLOCK);
         if (ret >= 0) {
             int device_fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
             if (device_fd >= 0) {
@@ -906,13 +908,17 @@ int main(int argc, char *argv[])
                     termios.c_oflag = termios.c_lflag = termios.c_iflag = 0;
 
                     if (tcsetattr(device_fd, 0, &termios) == 0) {
-                        return flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, 2, (void *)(intptr_t)file_fd, 2, 0, NULL, 0x08003000, 0x08002800);
+                        ret = flash_download(my_uart_recv, my_uart_send, my_firmware_recv, (void *)(intptr_t)device_fd, 2, (void *)(intptr_t)file_fd, 2, 0, NULL, 0x08003000, 0x08002800);
                     }
                 }
+                close(device_fd);
             }
         }
+        close(file_fd);
     }
 
-    perror(__func__);
-    return -1;
+    if (errno) {
+        perror(__func__);
+    }
+    return ret;
 }
