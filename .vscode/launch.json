@@ -11,7 +11,7 @@
             "program": "${workspaceFolder}/build/nationstech-uartboot-iap",
             "args": [
                 "-d",
-                "/dev/ttyACM1",
+                "/dev/ttyACM0",
                 "-f",
                 "Printf.bin"
             ],
